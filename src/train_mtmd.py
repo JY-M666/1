@@ -334,8 +334,10 @@ def main(args: argparse.Namespace) -> None:
 
     for epoch in range(args.n_epochs):
         train_loss = train_epoch(model, optimizer, train_loader, stock_num, args)
-        parameter_history.append(copy.deepcopy(model.state_dict()))
-        model.load_state_dict(average_params(parameter_history))
+        params_ckpt = copy.deepcopy(model.state_dict())
+        parameter_history.append(params_ckpt)
+        avg_state = average_params(parameter_history)
+        model.load_state_dict(avg_state)
         valid_loss, valid_metrics, _ = evaluate(model, valid_loader, stock_num, args)
         valid_ic = valid_metrics["IC"]
         print(
@@ -344,17 +346,25 @@ def main(args: argparse.Namespace) -> None:
             flush=True,
         )
 
+        should_stop = False
         if np.isfinite(valid_ic) and valid_ic > best_score:
             best_score = valid_ic
-            best_state = copy.deepcopy(model.state_dict())
+            best_state = copy.deepcopy(avg_state)
             best_epoch = epoch
             stale_epochs = 0
             torch.save(best_state, output_dir / "best_model.pt")
         else:
             stale_epochs += 1
             if stale_epochs >= args.early_stop:
-                print(f"early stopping at epoch {epoch}", flush=True)
-                break
+                should_stop = True
+
+        # Parameter smoothing is evaluation-only. Continue training from the
+        # raw parameters produced by this epoch so optimizer state and model
+        # parameters remain on the same training trajectory.
+        model.load_state_dict(params_ckpt)
+        if should_stop:
+            print(f"early stopping at epoch {epoch}", flush=True)
+            break
 
     if best_state is None:
         raise RuntimeError("validation IC was never finite; cannot select a checkpoint")
