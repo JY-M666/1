@@ -2,6 +2,8 @@
 
 本分支在官方 [StockMixer](https://github.com/SJTU-DMTai/StockMixer) 代码基础上，提供独立的 MTMD/Qlib baseline 管线；官方 `src/train.py` 不受影响，兄弟目录的 `mtmd-fixed` 也不需要修改。
 
+为保持仓库轻量，本分支不包含官方 NASDAQ、NYSE、SP500 的 `dataset/` 文件；这些文件不参与本基线训练。
+
 ## 与官方实现的差异
 
 - 数据与标签：Qlib `Alpha360`，标签为 `Ref($close, -1) / $close - 1`，并复用 MTMD 的 `DropnaLabel`、`CSRankNorm` 处理。
