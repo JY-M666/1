@@ -177,7 +177,10 @@ class NoGraphMixer(nn.Module):
 class StockMixer(nn.Module):
     def __init__(self, stocks, time_steps, channels, market, scale):
         super(StockMixer, self).__init__()
-        scale_dim = 8
+        # The scale branch receives the output of Conv1d(kernel_size=2,
+        # stride=2).  Infer its temporal length instead of assuming the
+        # original 16-day window (whose convolution output has length 8).
+        scale_dim = (time_steps - 2) // 2 + 1
         self.mixer = MultTime2dMixer(time_steps, channels, scale_dim=scale_dim)
         self.channel_fc = nn.Linear(channels, 1)
         self.time_fc = nn.Linear(time_steps * 2 + scale_dim, 1)
