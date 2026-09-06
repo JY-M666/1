@@ -1,16 +1,26 @@
-"""Train the official StockMixer architecture under the MTMD/Qlib protocol.
+"""Train StockMixer on MTMD/Qlib Alpha360 data with the official StockMixer objective.
 
-This script deliberately leaves ``src/train.py`` untouched.  It replaces only
-the original dataset and experiment loop with MTMD's Alpha360 handler,
-temporal split, MSE objective, validation-IC checkpoint selection, and daily
-cross-sectional evaluation.
+The data source and temporal split are adapted to MTMD/Qlib, while the training
+objective and main optimizer defaults follow the official StockMixer code:
+
+* raw next-day return labels (no CSRankNorm on labels)
+* regression MSE + alpha * pairwise ranking loss, alpha=0.1
+* Adam with lr=1e-3
+* 100 epochs by default
+* checkpoint selected by minimum validation total loss
+* no parameter smoothing and no gradient clipping
+
+Because Alpha360 features are scale-free and do not carry an absolute stock-price
+level, the model output is interpreted directly as a return score.  The exact
+official ``get_loss`` implementation is reused through an algebraically equivalent
+unit-base-price transform: predicted_price = 1 + predicted_return,
+base_price = 1.  Therefore the regression and pairwise ranking terms are exactly
+the same functions of predicted/ground-truth returns as in the official code.
 """
 
 from __future__ import annotations
 
 import argparse
-import collections
-import copy
 import datetime as dt
 import json
 import random
@@ -20,10 +30,9 @@ from typing import Dict, Iterator, Tuple
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
-from model import StockMixer
+from model import StockMixer, get_loss
 
 
 DEFAULT_PROVIDER_URI = "~/.qlib/qlib_data/cn_data"
@@ -40,19 +49,8 @@ def seed_everything(seed: int) -> None:
     torch.backends.cudnn.benchmark = False
 
 
-def average_params(params_list: collections.deque) -> collections.OrderedDict:
-    """Match the moving parameter average used by MTMD's baseline script."""
-    if not params_list:
-        raise ValueError("cannot average an empty parameter list")
-    n_params = len(params_list)
-    averaged = collections.OrderedDict()
-    for name in params_list[0]:
-        averaged[name] = sum(params[name] for params in params_list) / n_params
-    return averaged
-
-
 class DailyDataLoader:
-    """Keep each training item as one complete trading-day cross-section."""
+    """Keep each item as one complete trading-day cross-section."""
 
     def __init__(
         self,
@@ -119,11 +117,42 @@ def build_stockmixer_input(
     return dense.reshape(stock_num, d_feat, time_steps).permute(0, 2, 1).contiguous()
 
 
-def masked_mse(prediction: torch.Tensor, label: torch.Tensor) -> torch.Tensor:
-    mask = ~torch.isnan(label)
-    if not torch.any(mask):
+def author_loss(
+    prediction_return: torch.Tensor,
+    ground_truth_return: torch.Tensor,
+    alpha: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reuse the official StockMixer loss exactly, in return space.
+
+    Official StockMixer computes ``return_ratio=(prediction_price-base_price)/base_price``
+    and then applies MSE + alpha * pairwise ranking loss.  Alpha360 does not
+    preserve absolute price scale, so we set base_price=1 and
+    prediction_price=1+prediction_return.  This makes ``return_ratio`` exactly
+    equal to ``prediction_return`` while preserving the official loss formula.
+    """
+    if prediction_return.ndim != 1 or ground_truth_return.ndim != 1:
+        raise ValueError("prediction and ground truth must be one-dimensional")
+    if prediction_return.shape != ground_truth_return.shape:
+        raise ValueError("prediction and ground truth must have the same shape")
+
+    valid = torch.isfinite(ground_truth_return)
+    if not torch.any(valid):
         raise ValueError("a daily cross-section has no valid labels")
-    return nn.functional.mse_loss(prediction[mask], label[mask])
+
+    pred = prediction_return[valid].unsqueeze(-1)
+    gt = ground_truth_return[valid].unsqueeze(-1)
+    base_price = torch.ones_like(pred)
+    predicted_price = base_price + pred
+    mask = torch.ones_like(pred)
+
+    return get_loss(
+        predicted_price,
+        gt,
+        base_price,
+        mask,
+        pred.shape[0],
+        alpha,
+    )
 
 
 def _summarize_daily(values: list[float]) -> Dict[str, float]:
@@ -167,10 +196,13 @@ def evaluate(
     loader: DailyDataLoader,
     stock_num: int,
     args: argparse.Namespace,
-) -> Tuple[float, Dict[str, float], pd.DataFrame]:
+) -> Tuple[Dict[str, float], Dict[str, float], pd.DataFrame]:
     model.eval()
-    losses: list[float] = []
+    total_losses: list[float] = []
+    reg_losses: list[float] = []
+    rank_losses: list[float] = []
     outputs: list[pd.DataFrame] = []
+
     with torch.no_grad():
         for slc in loader.iter_daily():
             feature, label, stock_slots, index = loader.get(slc)
@@ -178,14 +210,29 @@ def evaluate(
                 feature, stock_slots, stock_num, args.d_feat, args.time_steps
             )
             prediction = model(model_input)[stock_slots].squeeze(-1)
-            losses.append(masked_mse(prediction, label).item())
+            total, reg, rank, return_ratio = author_loss(prediction, label, args.alpha)
+            total_losses.append(total.item())
+            reg_losses.append(reg.item())
+            rank_losses.append(rank.item())
+
+            valid = torch.isfinite(label)
             outputs.append(
                 pd.DataFrame(
-                    {"score": prediction.cpu().numpy(), "label": label.cpu().numpy()}, index=index
+                    {
+                        "score": return_ratio.squeeze(-1).cpu().numpy(),
+                        "label": label[valid].cpu().numpy(),
+                    },
+                    index=index[valid.cpu().numpy()],
                 )
             )
+
     predictions = pd.concat(outputs)
-    return float(np.mean(losses)), calculate_metrics(predictions), predictions
+    losses = {
+        "Loss": float(np.mean(total_losses)),
+        "MSE": float(np.mean(reg_losses)),
+        "RankLoss": float(np.mean(rank_losses)),
+    }
+    return losses, calculate_metrics(predictions), predictions
 
 
 def train_epoch(
@@ -194,23 +241,33 @@ def train_epoch(
     loader: DailyDataLoader,
     stock_num: int,
     args: argparse.Namespace,
-) -> float:
+) -> Dict[str, float]:
     model.train()
-    losses: list[float] = []
+    total_losses: list[float] = []
+    reg_losses: list[float] = []
+    rank_losses: list[float] = []
+
     for slc in loader.iter_daily(shuffle=True):
         feature, label, stock_slots, _ = loader.get(slc)
         model_input = build_stockmixer_input(
             feature, stock_slots, stock_num, args.d_feat, args.time_steps
         )
         prediction = model(model_input)[stock_slots].squeeze(-1)
-        loss = masked_mse(prediction, label)
+        total, reg, rank, _ = author_loss(prediction, label, args.alpha)
 
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_value_(model.parameters(), 3.0)
+        total.backward()
         optimizer.step()
-        losses.append(loss.item())
-    return float(np.mean(losses))
+
+        total_losses.append(total.item())
+        reg_losses.append(reg.item())
+        rank_losses.append(rank.item())
+
+    return {
+        "Loss": float(np.mean(total_losses)),
+        "MSE": float(np.mean(reg_losses)),
+        "RankLoss": float(np.mean(rank_losses)),
+    }
 
 
 def _slots_for_frame(frame: pd.DataFrame, stock_map: Dict[str, int], split_name: str) -> pd.Series:
@@ -225,8 +282,11 @@ def _slots_for_frame(frame: pd.DataFrame, stock_map: Dict[str, int], split_name:
     return pd.Series(slots.astype(np.int64), index=frame.index, name="stock_slot")
 
 
-def create_loaders(args: argparse.Namespace, device: torch.device) -> Tuple[DailyDataLoader, DailyDataLoader, DailyDataLoader, int]:
-    """Load exactly the MTMD Alpha360 handler and temporal splits."""
+def create_loaders(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> Tuple[DailyDataLoader, DailyDataLoader, DailyDataLoader, int]:
+    """Load Alpha360 features with raw next-day return labels."""
     try:
         import qlib
         from qlib.config import REG_CN
@@ -251,13 +311,15 @@ def create_loaders(args: argparse.Namespace, device: torch.device) -> Tuple[Dail
             "fit_end_time": train_end_time,
             "instruments": args.data_set,
             "infer_processors": [
-                {"class": "RobustZScoreNorm", "kwargs": {"fields_group": "feature", "clip_outlier": True}},
+                {
+                    "class": "RobustZScoreNorm",
+                    "kwargs": {"fields_group": "feature", "clip_outlier": True},
+                },
                 {"class": "Fillna", "kwargs": {"fields_group": "feature"}},
             ],
-            "learn_processors": [
-                {"class": "DropnaLabel"},
-                {"class": "CSRankNorm", "kwargs": {"fields_group": "label"}},
-            ],
+            # Official StockMixer trains against raw returns.  Keep only
+            # DropnaLabel here; do NOT cross-sectionally rank-normalize labels.
+            "learn_processors": [{"class": "DropnaLabel"}],
             "label": ["Ref($close, -1) / $close - 1"],
         },
     }
@@ -268,7 +330,9 @@ def create_loaders(args: argparse.Namespace, device: torch.device) -> Tuple[Dail
     }
     dataset = DatasetH(handler, segments)
     frames = dataset.prepare(
-        ["train", "valid", "test"], col_set=["feature", "label"], data_key=DataHandlerLP.DK_L
+        ["train", "valid", "test"],
+        col_set=["feature", "label"],
+        data_key=DataHandlerLP.DK_L,
     )
 
     stock_map = np.load(args.stock_index, allow_pickle=True).item()
@@ -283,7 +347,10 @@ def create_loaders(args: argparse.Namespace, device: torch.device) -> Tuple[Dail
         frame = frame.sort_index()
         loaders.append(
             DailyDataLoader(
-                frame["feature"], frame["label"], _slots_for_frame(frame, stock_map, split_name), device
+                frame["feature"],
+                frame["label"],
+                _slots_for_frame(frame, stock_map, split_name),
+                device,
             )
         )
     return *loaders, stock_num
@@ -294,24 +361,34 @@ def run_smoke_test(args: argparse.Namespace, device: torch.device) -> None:
     stock_num = 7
     active_slots = torch.tensor([0, 1, 3, 5, 6], dtype=torch.long, device=device)
     features = torch.randn(len(active_slots), args.d_feat * args.time_steps, device=device)
-    labels = torch.randn(len(active_slots), device=device)
+    labels = torch.randn(len(active_slots), device=device) * 0.02
     model = StockMixer(stock_num, args.time_steps, args.d_feat, args.market, args.scale).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    model_input = build_stockmixer_input(features, active_slots, stock_num, args.d_feat, args.time_steps)
+    model_input = build_stockmixer_input(
+        features,
+        active_slots,
+        stock_num,
+        args.d_feat,
+        args.time_steps,
+    )
     prediction = model(model_input)[active_slots].squeeze(-1)
-    loss = masked_mse(prediction, labels)
+    total, reg, rank, _ = author_loss(prediction, labels, args.alpha)
     optimizer.zero_grad()
-    loss.backward()
+    total.backward()
     optimizer.step()
     if prediction.shape != labels.shape:
         raise AssertionError(f"prediction shape {prediction.shape} does not match labels {labels.shape}")
-    print(f"smoke test passed: input={tuple(model_input.shape)}, loss={loss.item():.6f}")
+    print(
+        f"smoke test passed: input={tuple(model_input.shape)}, "
+        f"loss={total.item():.6f}, mse={reg.item():.6f}, rank={rank.item():.6f}"
+    )
 
 
 def main(args: argparse.Namespace) -> None:
     if args.batch_size > 0:
         raise ValueError("StockMixer needs a complete daily cross-section; use --batch_size -1")
+
     device = torch.device(args.device if args.device else ("cuda:0" if torch.cuda.is_available() else "cpu"))
     seed_everything(args.seed)
     if args.smoke_test:
@@ -326,60 +403,60 @@ def main(args: argparse.Namespace) -> None:
     train_loader, valid_loader, test_loader, stock_num = create_loaders(args, device)
     model = StockMixer(stock_num, args.time_steps, args.d_feat, args.market, args.scale).to(device)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    parameter_history: collections.deque = collections.deque(maxlen=args.smooth_steps)
-    best_score = -np.inf
+
+    best_valid_loss = np.inf
     best_state = None
     best_epoch = -1
     stale_epochs = 0
 
     for epoch in range(args.n_epochs):
-        train_loss = train_epoch(model, optimizer, train_loader, stock_num, args)
-        params_ckpt = copy.deepcopy(model.state_dict())
-        parameter_history.append(params_ckpt)
-        avg_state = average_params(parameter_history)
-        model.load_state_dict(avg_state)
-        valid_loss, valid_metrics, _ = evaluate(model, valid_loader, stock_num, args)
-        valid_ic = valid_metrics["IC"]
+        train_losses = train_epoch(model, optimizer, train_loader, stock_num, args)
+        valid_losses, valid_metrics, _ = evaluate(model, valid_loader, stock_num, args)
+
         print(
-            f"epoch={epoch:03d} train_mse={train_loss:.6f} valid_mse={valid_loss:.6f} "
-            f"valid_IC={valid_ic:.6f} valid_RankIC={valid_metrics['RankIC']:.6f}",
+            f"epoch={epoch:03d} "
+            f"train_loss={train_losses['Loss']:.6f} "
+            f"train_mse={train_losses['MSE']:.6f} "
+            f"train_rank={train_losses['RankLoss']:.6f} "
+            f"valid_loss={valid_losses['Loss']:.6f} "
+            f"valid_mse={valid_losses['MSE']:.6f} "
+            f"valid_rank={valid_losses['RankLoss']:.6f} "
+            f"valid_IC={valid_metrics['IC']:.6f} "
+            f"valid_RankIC={valid_metrics['RankIC']:.6f}",
             flush=True,
         )
 
-        should_stop = False
-        if np.isfinite(valid_ic) and valid_ic > best_score:
-            best_score = valid_ic
-            best_state = copy.deepcopy(avg_state)
+        if np.isfinite(valid_losses["Loss"]) and valid_losses["Loss"] < best_valid_loss:
+            best_valid_loss = valid_losses["Loss"]
+            best_state = {name: tensor.detach().clone() for name, tensor in model.state_dict().items()}
             best_epoch = epoch
             stale_epochs = 0
             torch.save(best_state, output_dir / "best_model.pt")
         else:
             stale_epochs += 1
-            if stale_epochs >= args.early_stop:
-                should_stop = True
 
-        # Parameter smoothing is evaluation-only. Continue training from the
-        # raw parameters produced by this epoch so optimizer state and model
-        # parameters remain on the same training trajectory.
-        model.load_state_dict(params_ckpt)
-        if should_stop:
+        # The official code trains all requested epochs.  Early stopping is
+        # disabled by default; --early_stop N is retained only as an optional
+        # experiment convenience.
+        if args.early_stop > 0 and stale_epochs >= args.early_stop:
             print(f"early stopping at epoch {epoch}", flush=True)
             break
 
     if best_state is None:
-        raise RuntimeError("validation IC was never finite; cannot select a checkpoint")
+        raise RuntimeError("validation loss was never finite; cannot select a checkpoint")
+
     model.load_state_dict(best_state)
-    train_loss, train_metrics, _ = evaluate(model, train_loader, stock_num, args)
-    valid_loss, valid_metrics, _ = evaluate(model, valid_loader, stock_num, args)
-    test_loss, test_metrics, test_predictions = evaluate(model, test_loader, stock_num, args)
+    train_losses, train_metrics, _ = evaluate(model, train_loader, stock_num, args)
+    valid_losses, valid_metrics, _ = evaluate(model, valid_loader, stock_num, args)
+    test_losses, test_metrics, test_predictions = evaluate(model, test_loader, stock_num, args)
     test_predictions.to_pickle(output_dir / "test_predictions.pkl")
 
     results = {
         "best_epoch": best_epoch,
         "stock_num": stock_num,
-        "train": {"MSE": train_loss, **train_metrics},
-        "valid": {"MSE": valid_loss, **valid_metrics},
-        "test": {"MSE": test_loss, **test_metrics},
+        "train": {**train_losses, **train_metrics},
+        "valid": {**valid_losses, **valid_metrics},
+        "test": {**test_losses, **test_metrics},
         "args": vars(args),
     }
     with (output_dir / "metrics.json").open("w", encoding="utf-8") as stream:
@@ -397,10 +474,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--market", type=int, default=20)
     parser.add_argument("--scale", type=int, default=3)
     parser.add_argument("--batch_size", type=int, default=-1)
-    parser.add_argument("--n_epochs", type=int, default=200)
-    parser.add_argument("--lr", type=float, default=2e-4)
-    parser.add_argument("--early_stop", type=int, default=30)
-    parser.add_argument("--smooth_steps", type=int, default=5)
+    parser.add_argument("--n_epochs", type=int, default=100)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--alpha", type=float, default=0.1)
+    parser.add_argument(
+        "--early_stop",
+        type=int,
+        default=0,
+        help="0 disables early stopping (official behavior); N enables patience N",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="")
     parser.add_argument("--outdir", default="")
